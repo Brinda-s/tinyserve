@@ -49,6 +49,8 @@ def main() -> None:
     ap.add_argument("--new-tokens", type=int, default=128)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--skip-no-cache", action="store_true", help="the no-cache loop is slow on CPU")
+    ap.add_argument("--with-tinyflash", action="store_true",
+                    help="also run the KV-cache loop with gpu-kernels FlashAttention for prefill (CUDA)")
     args = ap.parse_args()
 
     device = torch.device(args.device) if args.device else pick_device()
@@ -60,7 +62,8 @@ def main() -> None:
     print(f"{args.model} on {name}, {str(dtype).removeprefix('torch.')}, {model.num_params / 1e6:.0f}M params, "
           f"{args.new_tokens} new tokens, median of {args.repeats}\n")
 
-    def ours(prompt, use_cache):
+    def ours(prompt, use_cache, backend="sdpa"):
+        model.attn_backend = backend
         r = generate(model, prompt, args.new_tokens, use_cache=use_cache)  # no EOS: always full length
         return r.ttft_s, r.decode_tokens_per_s
 
@@ -78,7 +81,7 @@ def main() -> None:
         return ttft, (args.new_tokens - 1) / (total - ttft)
 
     results = []
-    print(f"{'prompt':>7}  {'method':<22} {'TTFT ms':>9} {'decode tok/s':>13}")
+    print(f"{'prompt':>7}  {'method':<26} {'TTFT ms':>9} {'decode tok/s':>13}")
     for n in args.prompt_lens:
         prompt = make_prompt(tok, n)
         methods = [("tinyserve no cache", lambda: ours(prompt, False)),
@@ -86,12 +89,14 @@ def main() -> None:
                    ("HF generate", lambda: hf_run(prompt))]
         if args.skip_no_cache:
             methods = methods[1:]
+        if args.with_tinyflash:
+            methods.insert(-1, ("tinyserve KV + tinyflash", lambda: ours(prompt, True, "tinyflash")))
         for label, fn in methods:
             fn()  # warm-up
             runs = [fn() for _ in range(args.repeats)]
             ttft = statistics.median(r[0] for r in runs) * 1e3
             tps = statistics.median(r[1] for r in runs)
-            print(f"{n:>7}  {label:<22} {ttft:>9.1f} {tps:>13.1f}")
+            print(f"{n:>7}  {label:<26} {ttft:>9.1f} {tps:>13.1f}")
             results.append({"prompt_len": n, "method": label, "ttft_ms": ttft, "decode_tok_s": tps})
         print()
 

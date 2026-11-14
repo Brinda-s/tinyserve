@@ -29,12 +29,14 @@ def main() -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
     ap.add_argument("--new-tokens", type=int, default=32)
+    ap.add_argument("--attn-backend", default="sdpa", choices=["sdpa", "tinyflash"])
     args = ap.parse_args()
     device, dtype = torch.device(args.device), getattr(torch, args.dtype)
     strict = dtype == torch.float32
     logit_tol = 1e-2 if strict else 0.5  # logits are O(10); fp16 rounding moves them by ~0.1
 
     ours, path = load_model(args.model, device, dtype)
+    ours.attn_backend = args.attn_backend
     tok = AutoTokenizer.from_pretrained(path)
     ref = AutoModelForCausalLM.from_pretrained(path, dtype=dtype).to(device).eval()
     eos = ref.generation_config.eos_token_id
@@ -45,7 +47,7 @@ def main() -> int:
     if hasattr(prompt_ids, "input_ids"):
         prompt_ids = prompt_ids["input_ids"]
     prompt_ids = list(prompt_ids)
-    print(f"model={args.model} device={device} dtype={args.dtype} params={ours.num_params / 1e6:.0f}M "
+    print(f"model={args.model} device={device} dtype={args.dtype} attn={args.attn_backend} params={ours.num_params / 1e6:.0f}M "
           f"prompt={len(prompt_ids)} tokens")
     ok = True
 
