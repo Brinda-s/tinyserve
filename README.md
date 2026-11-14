@@ -14,72 +14,126 @@ PyTorch in [`tinyserve/model.py`](tinyserve/model.py); only the tokenizer comes 
 | Step | What | Status |
 |---|---|---|
 | 1 | Model from scratch + naive generation (recompute the whole sequence every token) | ✅ matches Hugging Face exactly |
-| 2 | **KV cache**: prefill once, then decode one token at a time | ✅ 3.7–9× faster decode (CPU) |
-| 3 | **Hand-written FlashAttention** from [gpu-kernels](https://github.com/Brinda-s/gpu-kernels) for prefill | ⏳ written; needs a CUDA GPU run |
+| 2 | **KV cache**: prefill once, then decode one token at a time | ✅ 5.9× faster decode at 2k-token prompts (T4) |
+| 3 | **Hand-written FlashAttention** from [gpu-kernels](https://github.com/Brinda-s/gpu-kernels) for prefill | ✅ correct in the full model; prefill 1.0–1.2× (see why below) |
 | 4 | **Continuous batching**: requests join and leave the batch every step | ✅ token-identical to single requests |
 | 5 | **Paged KV cache**: memory in 16-token blocks, with preemption when full | ✅ token-identical, incl. preemption |
-| 6 | **Load test**: four serving strategies under the same memory budget | ✅ CPU results below; GPU next |
+| 6 | **Load test**: four serving strategies under the same memory budget | ✅ T4: **17×** the throughput of one-at-a-time serving |
 
 ## Results
 
-### Step 6: serving 24 requests with the same 48 MB of KV-cache memory (CPU, fp32)
+### Step 6: serving 64 requests with the same 192 MB of KV-cache memory (Tesla T4, fp16)
 
-24 requests arriving at once, prompts 16–192 tokens, outputs 8–64 tokens (749 output tokens total).
-Every configuration gets a KV-cache budget of 2,048 tokens.
+64 requests arriving at once, prompts 32–512 tokens, outputs 16–256 tokens (8,523 output tokens).
+Every configuration gets a KV-cache budget of 16,384 tokens: 21 slots of 768 tokens, or 1,024
+blocks of 16.
 
-| Strategy | Throughput | Wall time | Median time to first token | Median latency | Mean batch | Peak concurrent | KV memory actually used |
+| Strategy | Throughput | Wall time | Median time to first token | p95 latency | Mean batch | Peak concurrent | KV memory actually used |
 |---|---|---|---|---|---|---|---|
-| Sequential | 9.8 tok/s | 76.6 s | 38.7 s | 40.3 s | 1.0 | 1 | 82% |
-| Static batching | 11.1 tok/s | 67.3 s | 11.7 s | 22.4 s | 4.1 | 8 | 49% |
-| Continuous + slots | 13.0 tok/s | 57.5 s | 14.3 s | 35.5 s | 5.8 | 8 | 56% |
-| **Continuous + paged** | **27.5 tok/s** | **27.2 s** | **6.3 s** | **20.4 s** | **9.0** | **18** | **95%** |
+| Sequential | 34 tok/s | 248.5 s | 132.1 s | 240.1 s | 1.0 | 1 | 92% |
+| Static batching | 342 tok/s | 24.9 s | 8.0 s | 23.3 s | 11.0 | 21 | 42% |
+| Continuous + slots | 506 tok/s | 16.8 s | 4.3 s | 15.6 s | 17.0 | 21 | 52% |
+| **Continuous + paged** | **593 tok/s** | **14.4 s** | **0.97 s** | **13.5 s** | **31.1** | **54** | **98%** |
 
 What the table shows:
 
-- **Batching helps because decode is memory-bound.** Each decode step reads all ~2 GB of fp32
-  weights whether it serves one request or nine, so more requests per step means more tokens
-  per byte read.
-- **Static batching wastes the batch.** A batch finishes only when its longest request does, so
-  the mean batch size (4.1) stays far below the 8 slots available.
-- **Continuous batching keeps slots full** by admitting a new request the moment one finishes.
-- **Slots waste memory.** Each slot reserves room for the *longest possible* request (256 tokens),
-  but the average request uses far less, so only 56% of reserved memory holds real tokens and
-  only 8 requests fit.
-- **Paged memory fixes that.** Blocks are handed out as sequences grow, 95% of reserved memory
-  holds real tokens, and 18 requests run at once in the same 48 MB. That doubles throughput
-  over slots. The 4 preemptions are the price: when blocks run out, the newest request is
-  paused, its blocks freed, and it is recomputed later with identical output.
+- **One request at a time leaves the GPU idle.** A single sequence decodes at about 42 tokens/s on
+  the T4 (see step 2 below), nowhere near what the hardware can do, so serving 64 people one by one
+  takes four minutes.
+- **Batching is almost free per extra request.** A decode step with 31 sequences costs little more
+  than a step with one, because each step reads the same weights. That is why static batching is
+  already 10× faster.
+- **Static batching wastes the batch.** A batch ends only when its longest request does, so the mean
+  batch (11.0) stays well below the 21 slots.
+- **Continuous batching keeps the slots full**: +48% throughput, and half the time to first token.
+- **Slots waste memory.** Each slot reserves 768 tokens for the longest possible request; only 52% of
+  that holds real tokens, which caps the batch at 21.
+- **Paged memory fixes that.** 98% of reserved memory holds real tokens, up to 54 requests run at
+  once, throughput rises another 17%, and the median request sees its first token in under a second
+  instead of 4.3 s. The 18 preemptions are the price: paused requests are recomputed later.
 
-### Step 2: KV cache, single request (CPU, fp32, 64 new tokens)
+The same experiment on the CPU (24 requests, 48 MB budget) showed the same ordering: paged
+continuous batching at 2.8× sequential and 2.1× slots.
+
+### Step 3: the gpu-kernels FlashAttention inside the model (Tesla T4, fp16)
+
+The kernel matches PyTorch SDPA to within 1.2e-3 for prompt lengths 1 to 1,031 (including lengths
+that need padding), and with it plugged in the model still produces the same 32 greedy tokens as
+Hugging Face. Speed, for the whole model's prefill:
+
+| Prompt | SDPA | gpu-kernels FlashAttention | Speedup |
+|---|---|---|---|
+| 512 | 36.5 ms | 30.7 ms | 1.19× |
+| 1,024 | 51.6 ms | 52.2 ms | 0.99× |
+| 2,048 | 109.5 ms | 108.4 ms | 1.01× |
+| 4,096 | 234.2 ms | 227.2 ms | 1.03× |
+
+The kernel alone is 21–26% faster than PyTorch's fp16 attention on this GPU (gpu-kernels
+benchmark), so why does the model barely speed up? **Amdahl's law.** For a 0.5B model, prefill time
+is dominated by the linear layers (about 0.7 GFLOP per token). Attention is a small share: about 3%
+of the work at 512 tokens and about 20% at 4,096. A 25% faster kernel applied to 20% of the work
+gives at most a 5% gain, and padding to 64-token tiles plus fp16/fp32 conversions eat part of that.
+Attention kernels pay off on long contexts and larger head counts, not on short prompts to a small
+model.
+
+### Step 2: KV cache, single request (Tesla T4, fp16, 128 new tokens)
 
 | Prompt | Method | Time to first token | Decode tokens/s |
 |---|---|---|---|
-| 128 | no cache | 307 ms | 2.7 |
-| 128 | **KV cache** | 197 ms | **10.1** (3.7×) |
-| 128 | HF generate | 219 ms | 9.7 |
-| 512 | no cache | 659 ms | 1.5 |
-| 512 | **KV cache** | 601 ms | **13.9** (9×) |
-| 512 | HF generate | 597 ms | 8.2 |
+| 128 | no cache | 22.8 ms | 42.7 |
+| 128 | **KV cache** | 27.1 ms | **43.1** |
+| 512 | no cache | 29.6 ms | 29.9 |
+| 512 | **KV cache** | 26.0 ms | **41.9** (1.4×) |
+| 1,024 | no cache | 60.1 ms | 14.8 |
+| 1,024 | **KV cache** | 52.5 ms | **42.6** (2.9×) |
+| 2,048 | no cache | 130.0 ms | 7.1 |
+| 2,048 | **KV cache** | 150.4 ms | **41.8** (5.9×) |
+| 2,048 | HF generate | 117.7 ms | 40.1 |
 
-All CPU numbers are from an Apple-silicon laptop and are noisy (single runs). GPU numbers
-(Colab T4, fp16) come next: see "Run on a GPU" below.
+Without a cache, decode slows as the context grows (42.7 → 7.1 tok/s), because every step
+redoes the whole sequence. With the cache it stays flat at about 42 tok/s, slightly ahead of
+Hugging Face. At a 128-token prompt the cache makes no difference on a GPU: recomputing 128 tokens
+in parallel costs about the same as computing one.
+
+That flat 42 tok/s is itself a finding. Reading ~1 GB of fp16 weights at the T4's 320 GB/s would
+allow roughly 300 tokens/s, so single-request decode reaches only about 13% of the memory limit.
+Each token runs about 24 layers × ~20 small GPU operations, and at batch size 1 the time goes to
+launching them from Python, not to the work inside them. This is why batching (step 6) helps so
+much, and why production engines capture the decode step in a CUDA graph.
+
+### On the CPU (Apple silicon laptop, fp32)
+
+KV cache, single request, 64 new tokens: 3.7× faster decode at a 128-token prompt and 9× at
+512 tokens. Load test (24 requests, 48 MB budget): sequential 9.8 tok/s, static batching 11.1,
+continuous + slots 13.0, continuous + paged 27.5 tok/s.
 
 ## Correctness
 
 Every step is held to exact agreement, not "looks reasonable":
 
-| Test | What it checks | Result (CPU, fp32) |
+| Test | What it checks | Result (CPU fp32 unless noted) |
 |---|---|---|
 | `tests/test_vs_hf.py` | prompt logits vs the Hugging Face model | max difference **0.0** |
 | | greedy tokens: our no-cache loop, our KV-cache loop, HF `generate()` | 48/48 identical |
 | | chunked prefill vs single prefill | max difference 0.0 |
 | `tests/test_engine.py` | 10 requests in 3 waves; engine output vs each request run alone | **10/10 identical** in all 4 configs |
 | | ... including a paged cache too small for everyone (3 preemptions) | 10/10 identical |
-| `tests/test_flash.py` | gpu-kernels FlashAttention vs PyTorch SDPA, kernel and whole model | needs a CUDA GPU |
+| `tests/test_flash.py` | gpu-kernels FlashAttention vs PyTorch SDPA, kernel alone | max difference 1.2e-3 (T4, fp16) |
+| | ... inside the whole model | 99.5% same top token at every position (T4, fp16) |
 
-One thing the tests caught: Qwen's instruct checkpoint ships `repetition_penalty: 1.1` in its
-generation config, which Hugging Face applies even in greedy mode. The comparison turns it off
-so both sides do plain greedy decoding.
+On the T4 in fp16, `test_vs_hf.py` also passes with 32/32 identical tokens, with and without the
+gpu-kernels FlashAttention. `test_engine.py` in fp16 gave 10/10 identical requests in three of the
+four configurations, and 9/10 in the one that forces preemption: the preempted request was
+recomputed through a prefill instead of decode steps, which adds the same numbers in a different
+order, and in fp16 that flipped a near-tie between two tokens later in the sequence. In fp32 all
+four configurations are 10/10 identical, so the engine logic is exact; the fp16 test now requires
+the first 8 tokens of each request to match.
+
+Two things the tests caught:
+- Qwen's instruct checkpoint ships `repetition_penalty: 1.1` in its generation config, which
+  Hugging Face applies even in greedy mode. The comparison turns it off so both sides do plain
+  greedy decoding.
+- Exact token agreement is only a fair test in fp32, for the near-tie reason above.
 
 ## How it works
 
@@ -148,10 +202,23 @@ python -m bench.bench_load                         # 128 requests, 16k-token KV 
 ```
 
 `tests/test_flash.py` builds the CUDA extension on first use (about a minute). In fp16 the
-greedy outputs can diverge from Hugging Face after a few tokens on near-ties, so the fp16 checks
-in `test_vs_hf.py` require the first 8 tokens to match rather than all of them. `test_engine.py`
-still demands exact matches, so in fp16 a batched run may differ from a single run on a rare
-near-tie; the strict check is the CPU fp32 one.
+tests require the first 8 tokens of each sequence to match rather than all of them, because a
+near-tie between two tokens can flip when the same sums are added in a different order. The
+strict, every-token checks are the CPU fp32 runs.
+
+To run it in Colab with no setup: open a notebook with a T4 runtime, then
+`!git clone https://github.com/Brinda-s/tinyserve`, `%cd tinyserve`,
+`!pip install -q -r requirements.txt ninja`, and the commands above prefixed with `!`.
+
+## What I'd do next
+
+- **CUDA graphs for decode.** Single-request decode reaches only ~13% of the T4's memory bandwidth
+  because of launch overhead. Capturing a decode step as a graph replays it with one launch.
+- **Batched and chunked prefill.** New requests are prefilled one at a time, which pauses decoding
+  for everyone else. Splitting long prompts into chunks and mixing them into decode steps evens
+  out latency.
+- **A paged-attention kernel.** The paged cache gathers each sequence's blocks into a contiguous
+  copy before attention. Reading blocks directly inside the kernel, as vLLM does, removes that copy.
 
 ## Layout
 

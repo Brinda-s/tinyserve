@@ -81,18 +81,29 @@ def main() -> int:
          "continuous"),
         ("static + paged cache", lambda: PagedCache(model.cfg, 128, 16, device, dtype), "static"),
     ]
+    # fp32: every request must be token-identical. fp16/bf16: a batched or re-prefilled request runs
+    # the same math in a different order, so a near-tie between two tokens can flip late in a
+    # sequence. There, each request must match for its first 8 tokens (or all of it, if shorter).
+    strict = dtype == torch.float32
+
+    def agree(x: list[int], y: list[int]) -> int:
+        n = 0
+        while n < min(len(x), len(y)) and x[n] == y[n]:
+            n += 1
+        return n
+
     ok = True
     for name, make_cache, policy in configs:
         reqs, stats = run_engine(model, make_cache(), specs, eos_ids, policy)
         same = sum(r.output == e for r, e in zip(reqs, expected))
-        passed = same == len(specs)
+        close = all(r.output == e or agree(r.output, e) >= min(8, len(e)) for r, e in zip(reqs, expected))
+        passed = same == len(specs) if strict else close
         ok &= passed
         print(f"  [{'ok' if passed else 'FAIL':>4}] {name:<32} {same}/{len(specs)} requests identical, "
               f"mean decode batch {stats.mean_decode_batch:.1f}, preemptions {stats.preemptions}")
-        if not passed:
-            for i, (r, e) in enumerate(zip(reqs, expected)):
-                if r.output != e:
-                    print(f"         request {i}: got {r.output[:12]}... want {e[:12]}...")
+        for i, (r, e) in enumerate(zip(reqs, expected)):
+            if r.output != e:
+                print(f"         request {i}: same first {agree(r.output, e)} of {len(e)} tokens, then diverges")
     print("ALL PASSED" if ok else "SOME CHECKS FAILED")
     return 0 if ok else 1
 
